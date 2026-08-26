@@ -188,3 +188,5 @@ without disturbing what already exists:
   bodies of `src/infrastructure/services/instrumentation.service.ts` and
   `crash-reporter.service.ts` with calls into the SDK. The ports and every
   call site are already in place.
+
+Incluindo essa linha para startar deploy
