@@ -1,0 +1,168 @@
+name: CD
+
+# Triggered by merges (pushes) to homol/prod. The migration job runs under
+# that stage's GitHub Environment. Configure a required reviewer on the
+# `prod` Environment and approval is then required BEFORE the migration
+# step runs, not merely before the deploy step.
+on:
+  push:
+    branches:
+      - homol
+      - prod
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Migrate (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STAGE: ${{ github.ref_name }}
+      SSM_PATH: /${{ github.event.repository.name }}/${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Pipeline validates that the expected parameter NAMES exist under this
+      # stage's SSM path. It never calls GetParameter/decrypt and never
+      # handles a parameter VALUE. Actual value resolution happens inside the
+      # Amplify compute role at runtime.
+      - name: Validate expected SSM parameter names exist
+        run: |
+          set -euo pipefail
+          # Keep this list in sync with the required keys in .env.example.
+          expected=(DATABASE_URL)
+
+          present=$(aws ssm get-parameters-by-path \
+            --path "$SSM_PATH" \
+            --recursive \
+            --query 'Parameters[].Name' \
+            --output text)
+
+          missing=()
+          for name in "${expected[@]}"; do
+            if ! grep -qx "${SSM_PATH}/${name}" <<< "$(tr '\t' '\n' <<< "$present")"; then
+              missing+=("$name")
+            fi
+          done
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "Missing expected SSM parameters under ${SSM_PATH}: ${missing[*]}" >&2
+            exit 1
+          fi
+
+          echo "All expected parameter names present under ${SSM_PATH}."
+
+      - name: Apply pending migrations against ${{ github.ref_name }} database
+        env:
+          DATABASE_URL_SSM_NAME: ${{ env.SSM_PATH }}/DATABASE_URL
+        run: |
+          set -euo pipefail
+
+          # The only place in the pipeline that reads a parameter VALUE is
+          # this line, and only for DATABASE_URL to open the db connection
+          # itself — it is never logged, echoed, or exposed as a job output.
+          # This is distinct from the name-only validation step above.
+          db_url=$(aws ssm get-parameter --name "$DATABASE_URL_SSM_NAME" --with-decryption --query 'Parameter.Value' --output text)
+
+          # No migration tool is wired in yet (this bootstrap skipped
+          # Supabase). Plug one in here — e.g. `npx supabase db push
+          # --db-url "$db_url"`, `npx node-pg-migrate`, or `npx drizzle-kit
+          # migrate` — before the first deploy that needs a schema change.
+          # Whatever you pick, prefer one that tracks applied migrations on
+          # the target database so a re-run against a partially-migrated
+          # database is idempotent; a plain `psql -f` loop is not.
+          echo "No migration tool configured yet; skipping schema migration." >&2
+
+  deploy:
+    name: Deploy (${{ github.ref_name }})
+    needs: migrate
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 20
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AMPLIFY_APP_ID: ${{ vars.AMPLIFY_APP_ID }}
+      AMPLIFY_BRANCH: ${{ github.ref_name }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Points the Amplify branch at this deploy's config before the build
+      # starts: STAGE is the literal branch name (never read from SSM), and
+      # SSM_PATH is only the path where the rest of that stage's config
+      # lives — never a parameter value. amplify.yml's preBuild step reads
+      # SSM_PATH to resolve the rest under the per-stage compute role.
+      - name: Point Amplify branch at this deploy's STAGE/SSM_PATH
+        run: |
+          set -euo pipefail
+          aws amplify update-branch \
+            --app-id "$AMPLIFY_APP_ID" \
+            --branch-name "$AMPLIFY_BRANCH" \
+            --environment-variables STAGE="$AMPLIFY_BRANCH",SSM_PATH="/${{ github.event.repository.name }}/$AMPLIFY_BRANCH"
+
+      - name: Start Amplify deploy job
+        id: start
+        run: |
+          set -euo pipefail
+          job_id=$(aws amplify start-job \
+            --app-id "$AMPLIFY_APP_ID" \
+            --branch-name "$AMPLIFY_BRANCH" \
+            --job-type RELEASE \
+            --query 'jobSummary.jobId' \
+            --output text)
+          echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
+
+      # Polls for a real terminal status from Amplify. The job-level
+      # `timeout-minutes: 20` above is the hard bound: if no terminal status
+      # arrives in time, GitHub Actions fails this job — it never reports
+      # success on a fire-and-forget start-job call.
+      - name: Wait for deploy job to reach a terminal status
+        run: |
+          set -euo pipefail
+          job_id="${{ steps.start.outputs.job_id }}"
+          delay=10
+
+          while true; do
+            status=$(aws amplify get-job \
+              --app-id "$AMPLIFY_APP_ID" \
+              --branch-name "$AMPLIFY_BRANCH" \
+              --job-id "$job_id" \
+              --query 'job.summary.status' \
+              --output text)
+
+            echo "Amplify job $job_id status: $status"
+
+            case "$status" in
+              SUCCEED)
+                exit 0
+                ;;
+              FAILED|CANCELLED)
+                echo "Amplify deploy job ended with status $status" >&2
+                exit 1
+                ;;
+            esac
+
+            sleep "$delay"
+            if [ "$delay" -lt 60 ]; then
+              delay=$((delay * 2))
+            fi
+          done

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - homol
+      - prod
+
+# Deliberately no `permissions: id-token` and no cloud credentials of any
+# kind: a pull request from a fork must be able to run the full unit suite
+# without ever holding an AWS or database credential. The suite runs under
+# STAGE=test (.env.test), where every port is bound to its in-memory mock,
+# so it needs no network access at all.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm test

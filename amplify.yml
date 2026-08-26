@@ -1,0 +1,44 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        # Resolves every SSM parameter under SSM_PATH (set by cd.yml's
+        # `update-branch` step ahead of this build) into a `.env` file
+        # consumed by `next build`. Runs under this stage's compute role,
+        # which is the only identity permitted to decrypt these values —
+        # never the pipeline's OIDC role, which validates parameter NAMES
+        # only. STAGE is deliberately excluded: it already arrives as a
+        # native Amplify branch env var from the same update-branch call.
+        - |
+          set -o pipefail
+          # Which identity the build container actually has. An ARN in an
+          # account other than this app's means no service role is attached
+          # and the SSM read below cannot possibly succeed — that misread
+          # cost two deploy cycles, so it is logged, not
+          # inferred. Safe to print: an assumed-role ARN, not a credential.
+          aws sts get-caller-identity --query Arn --output text
+          aws ssm get-parameters-by-path \
+            --path "$SSM_PATH" \
+            --recursive \
+            --with-decryption \
+            --query 'Parameters[].[Name,Value]' \
+            --output text | \
+          while IFS=$'\t' read -r name value; do
+            key="${name#$SSM_PATH/}"
+            if [ "$key" = "STAGE" ]; then
+              continue
+            fi
+            echo "${key}=${value}" >> .env
+          done
+        - npm ci
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: .next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
