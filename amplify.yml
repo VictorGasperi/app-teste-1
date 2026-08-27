@@ -10,6 +10,7 @@ frontend:
         # never the pipeline's OIDC role, which validates parameter NAMES
         # only. STAGE is deliberately excluded: it already arrives as a
         # native Amplify branch env var from the same update-branch call.
+        # teste
         - |
           set -o pipefail
           # Which identity the build container actually has. An ARN in an
