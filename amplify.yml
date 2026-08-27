@@ -4,13 +4,22 @@ frontend:
     preBuild:
       commands:
         # Resolves every SSM parameter under SSM_PATH (set by cd.yml's
-        # `update-branch` step ahead of this build) into a `.env` file
-        # consumed by `next build`. Runs under this stage's compute role,
-        # which is the only identity permitted to decrypt these values —
-        # never the pipeline's OIDC role, which validates parameter NAMES
-        # only. STAGE is deliberately excluded: it already arrives as a
-        # native Amplify branch env var from the same update-branch call.
-        # teste
+        # `update-branch` step ahead of this build) into `.env.production`.
+        # Runs under this stage's compute role, which is the only identity
+        # permitted to decrypt these values — never the pipeline's OIDC
+        # role, which validates parameter NAMES only.
+        #
+        # Must be `.env.production`, not `.env`: Amplify Hosting's SSR
+        # runtime only exposes variables that were written to
+        # `.env.production` during the build — a plain `.env` file is only
+        # ever read by `next build` itself and never reaches the deployed
+        # compute (https://docs.aws.amazon.com/amplify/latest/userguide/ssr-environment-variables.html).
+        # STAGE is included explicitly for the same reason: branch-level
+        # Amplify environment variables (STAGE, SSM_PATH) do NOT propagate
+        # into the SSR runtime's process.env on their own, only into the
+        # build container — the missing STAGE at runtime is what caused the
+        # eager `stage` validation in src/env/environments.ts to throw on
+        # every request, surfacing as a 500 with no application log.
         - |
           set -o pipefail
           # Which identity the build container actually has. An ARN in an
@@ -19,6 +28,7 @@ frontend:
           # cost two deploy cycles, so it is logged, not
           # inferred. Safe to print: an assumed-role ARN, not a credential.
           aws sts get-caller-identity --query Arn --output text
+          echo "STAGE=${STAGE}" >> .env.production
           aws ssm get-parameters-by-path \
             --path "$SSM_PATH" \
             --recursive \
@@ -30,7 +40,7 @@ frontend:
             if [ "$key" = "STAGE" ]; then
               continue
             fi
-            echo "${key}=${value}" >> .env
+            echo "${key}=${value}" >> .env.production
           done
         - npm ci
     build:
